@@ -12,11 +12,12 @@ use sctk::compositor::{CompositorState, Region, SurfaceData};
 use sctk::reexports::protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
 use sctk::shell::xdg::window::Window as SctkWindow;
 use sctk::shell::xdg::window::WindowDecorations;
+use sctk::shell::xdg::XdgSurface;
 use sctk::shell::WaylandSurface;
 
 use log::warn;
 
-use crate::dpi::{LogicalSize, PhysicalPosition, PhysicalSize, Position, Size};
+use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{ExternalError, NotSupportedError, OsError as RootOsError};
 use crate::event::{Ime, WindowEvent};
 use crate::event_loop::AsyncRequestSerial;
@@ -276,8 +277,13 @@ impl Window {
     }
 
     #[inline]
-    pub fn set_outer_position(&self, _: Position) {
+    pub fn set_outer_position(&self, pos: Position) {
         // Not possible on Wayland.
+        let window_state = self.window_state.lock().unwrap();
+        let scale_factor = window_state.scale_factor();
+        let LogicalPosition { x, y } = pos.to_logical(scale_factor);
+        let LogicalSize { width, height } = window_state.inner_size();
+        self.window.set_window_geometry(x, y, width, height);
     }
 
     #[inline]
