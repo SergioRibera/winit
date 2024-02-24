@@ -146,6 +146,14 @@ impl Window {
         window_state.set_min_inner_size(min_size);
         window_state.set_max_inner_size(max_size);
 
+        // set initial geometry of window
+        if let Some(pos) = attributes.position {
+            let LogicalPosition { x, y } = pos.to_logical(1.);
+            let LogicalSize { width, height } = window_state.inner_size();
+            println!("Setting default geometry: {x},{y} {width}x{height}");
+            window.set_window_geometry(x, y, width, height);
+        }
+
         // Non-resizable implies that the min and max sizes are set to the same value.
         window_state.set_resizable(attributes.resizable);
 
@@ -284,7 +292,9 @@ impl Window {
         let LogicalPosition { x, y } = pos.to_logical(scale_factor);
         let LogicalSize { width, height } = window_state.inner_size();
         println!("Setting outer Position: {x},{y} {width}x{height}");
-        self.window.set_window_geometry(x, y, width, height);
+        self.window
+            .xdg_surface()
+            .set_window_geometry(x, y, width as i32, height as i32);
     }
 
     #[inline]
