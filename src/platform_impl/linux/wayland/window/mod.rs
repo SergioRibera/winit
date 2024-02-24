@@ -283,6 +283,7 @@ impl Window {
         let scale_factor = window_state.scale_factor();
         let LogicalPosition { x, y } = pos.to_logical(scale_factor);
         let LogicalSize { width, height } = window_state.inner_size();
+        println!("Setting outer Position: {x},{y} {width}x{height}");
         self.window.set_window_geometry(x, y, width, height);
     }
 
