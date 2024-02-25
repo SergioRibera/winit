@@ -296,6 +296,7 @@ impl Window {
             .xdg_surface()
             .set_window_geometry(x, y, width as i32, height as i32);
         self.window.wl_surface().damage(x, y, width as i32, height as i32);
+        self.window.wl_surface().commit();
     }
 
     #[inline]
