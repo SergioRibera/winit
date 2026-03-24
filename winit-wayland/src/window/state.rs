@@ -4,8 +4,8 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use ahash::HashSet;
 use dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Size};
+use foldhash::HashSet;
 use sctk::compositor::{CompositorState, Region, SurfaceData, SurfaceDataExt};
 use sctk::globals::GlobalData;
 use sctk::reexports::client::backend::ObjectId;
@@ -181,6 +181,7 @@ enum ShellSpecificState {
         /// Min size.
         min_surface_size: LogicalSize<u32>,
         max_surface_size: Option<LogicalSize<u32>>,
+        resize_increments: Option<LogicalSize<u32>>,
     },
     WlrLayer {
         surface: LayerSurface,
@@ -234,6 +235,7 @@ impl WindowState {
                 stateless_size: initial_size.to_logical(1.),
                 max_surface_size: None,
                 min_surface_size: MIN_WINDOW_SIZE,
+                resize_increments: None,
             },
             cursor_grab_mode: GrabState::new(),
             selected_cursor: Default::default(),
@@ -380,6 +382,8 @@ impl WindowState {
             ref mut frame,
             ref mut csd_fails,
             ref mut stateless_size,
+            ref mut min_surface_size,
+            ref mut resize_increments,
             ..
         } = self.shell_specific
         else {
@@ -455,6 +459,42 @@ impl WindowState {
                 .1
                 .map(|bound_h| new_size.height.min(bound_h.get()))
                 .unwrap_or(new_size.height);
+        }
+
+        // Apply size increments.
+        //
+        // We conditionally apply increments to avoid conflicts with the compositor's layout rules:
+        // 1. If the window is floating (constrain == true), we snap to increments to ensure the
+        //    app's grid alignment.
+        // 2. If the user is interactively resizing (is_resizing), we snap the size to provide
+        //    feedback.
+        //
+        // However, we MUST NOT snap if the compositor enforces a specific size (constrain == false,
+        // or states like Maximized/Tiled). Snapping in these cases (e.g. corner tiling) would
+        // shrink the window below the allocated area, creating visible gaps between valid
+        // windows or screen edges.
+        if (constrain || configure.is_resizing())
+            && !configure.is_maximized()
+            && !configure.is_fullscreen()
+            && !configure.is_tiled()
+        {
+            if let Some(increments) = resize_increments {
+                // We use min size as a base size for the increments, similar to how X11 does it.
+                //
+                // This ensures that we can always reach the min size and the increments are
+                // calculated from it.
+                let (delta_width, delta_height) = (
+                    new_size.width.saturating_sub(min_surface_size.width),
+                    new_size.height.saturating_sub(min_surface_size.height),
+                );
+
+                let width =
+                    min_surface_size.width + (delta_width / increments.width) * increments.width;
+                let height = min_surface_size.height
+                    + (delta_height / increments.height) * increments.height;
+
+                new_size = (width, height).into();
+            }
         }
 
         let new_state = configure.state;
@@ -980,6 +1020,29 @@ impl WindowState {
         }
 
         self.selected_cursor = SelectedCursor::Custom(cursor);
+    }
+
+    /// Set the resize increments of the window.
+    pub fn set_resize_increments(&mut self, increments: Option<LogicalSize<u32>>) {
+         let ShellSpecificState::Xdg {
+            ref mut resize_increments,
+            ..
+        } = self.shell_specific
+        else {
+            unreachable!();
+        };
+
+        *resize_increments = increments;
+        // NOTE: We don't update the window size here, because it will be done on the next resize
+        // or configure event.
+    }
+
+    /// Get the resize increments of the window.
+    pub fn resize_increments(&self) -> Option<LogicalSize<u32>> {
+        match self.shell_specific {
+            ShellSpecificState::Xdg { resize_increments, .. } => resize_increments,
+            ShellSpecificState::WlrLayer { .. } => None,
+        }
     }
 
     fn apply_custom_cursor(&self, cursor: &CustomCursor) {
