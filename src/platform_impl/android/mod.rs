@@ -3,10 +3,10 @@ use std::collections::VecDeque;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction};
+use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction, TextInputState};
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
 };
@@ -33,6 +33,16 @@ pub(crate) use crate::cursor::{
 pub(crate) use crate::icon::NoIcon as PlatformIcon;
 
 static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
+
+/// Last-observed soft-keyboard buffer. `GameTextInput` sends full
+/// buffer snapshots per edit; winit's `Ime::Commit` is delta-based, so
+/// we diff against this mirror. Cleared by `set_ime_allowed(true)` so
+/// a focus change between fields starts from a clean baseline.
+static IME_TEXT_MIRROR: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn ime_text_mirror() -> &'static Mutex<String> {
+    IME_TEXT_MIRROR.get_or_init(|| Mutex::new(String::new()))
+}
 
 /// Returns the minimum `Option<Duration>`, taking into account that `None`
 /// equates to an infinite timeout, not a zero timeout (so can't just use
@@ -471,6 +481,71 @@ impl<T: 'static> EventLoop<T> {
                         };
                         callback(event, self.window_target());
                     },
+                }
+            },
+            InputEvent::TextEvent(state) => {
+                let new_text = state.text.clone();
+                let old_text = {
+                    let mut guard = ime_text_mirror().lock().unwrap_or_else(|e| e.into_inner());
+                    std::mem::replace(&mut *guard, new_text.clone())
+                };
+
+                if new_text == old_text {
+                    return InputStatus::Unhandled;
+                }
+
+                // Char-wise LCP: byte-wise would split multi-byte UTF-8.
+                let prefix_chars =
+                    old_text.chars().zip(new_text.chars()).take_while(|(a, b)| a == b).count();
+                let added: String = new_text.chars().skip(prefix_chars).collect();
+                let removed = old_text.chars().count().saturating_sub(prefix_chars);
+
+                let window_id = window::WindowId(WindowId);
+                let device_id = event::DeviceId(DeviceId(0));
+
+                for _ in 0..removed {
+                    let event = event::Event::WindowEvent {
+                        window_id,
+                        event: event::WindowEvent::KeyboardInput {
+                            device_id,
+                            event: event::KeyEvent {
+                                state: event::ElementState::Pressed,
+                                physical_key: crate::keyboard::PhysicalKey::Code(
+                                    crate::keyboard::KeyCode::Backspace,
+                                ),
+                                logical_key: crate::keyboard::Key::Named(
+                                    crate::keyboard::NamedKey::Backspace,
+                                ),
+                                location: crate::keyboard::KeyLocation::Standard,
+                                repeat: false,
+                                text: None,
+                                platform_specific: KeyEventExtra {},
+                            },
+                            is_synthetic: true,
+                        },
+                    };
+                    callback(event, self.window_target());
+                }
+
+                if !added.is_empty() {
+                    // `Ime::Commit` docstring requires an empty `Preedit` right before.
+                    callback(
+                        event::Event::WindowEvent {
+                            window_id,
+                            event: event::WindowEvent::Ime(event::Ime::Preedit(
+                                String::new(),
+                                None,
+                            )),
+                        },
+                        self.window_target(),
+                    );
+                    callback(
+                        event::Event::WindowEvent {
+                            window_id,
+                            event: event::WindowEvent::Ime(event::Ime::Commit(added)),
+                        },
+                        self.window_target(),
+                    );
                 }
             },
             _ => {
@@ -917,6 +992,13 @@ impl Window {
 
     pub fn set_ime_allowed(&self, allowed: bool) {
         if allowed {
+            // Reset mirror + GameTextInput buffer so a focus change
+            // between fields doesn't re-attribute the previous field's
+            // text to the new one on first keystroke.
+            if let Ok(mut mirror) = ime_text_mirror().lock() {
+                mirror.clear();
+            }
+            self.app.set_text_input_state(TextInputState::default());
             self.app.show_soft_input(true);
         } else {
             self.app.hide_soft_input(true);
