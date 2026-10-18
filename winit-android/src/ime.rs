@@ -10,6 +10,8 @@ pub(crate) struct ImeMirror {
     text: String,
     /// Caret, in bytes into `text`.
     cursor: usize,
+    /// Other end of the selection, in bytes into `text`.
+    anchor: usize,
 }
 
 /// The delta between two snapshots, as winit IME events.
@@ -28,12 +30,36 @@ impl ImeMirror {
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
+        self.anchor = 0;
     }
 
-    /// Record the snapshot `text`, with the caret `cursor_utf16` (UTF-16
-    /// code units, as `GameTextInput` counts), and return the edit that
-    /// produced it.
-    pub fn update(&mut self, text: &str, cursor_utf16: usize) -> Option<ImeEdit> {
+    /// Adopt `text` with the selection from byte `anchor` to byte `cursor`,
+    /// as the application describes the field. Returns the caret and the
+    /// anchor as UTF-16 offsets, to load the same state into
+    /// `GameTextInput`, or `None` when the keyboard already has it: the
+    /// application echoing back an edit the keyboard just made. Loading it
+    /// again would restart the input connection and lose the composing word.
+    pub fn load(&mut self, text: &str, cursor: usize, anchor: usize) -> Option<(usize, usize)> {
+        let (cursor, anchor) = (cursor.min(text.len()), anchor.min(text.len()));
+        if self.text == text && self.cursor == cursor && self.anchor == anchor {
+            return None;
+        }
+        text.clone_into(&mut self.text);
+        self.cursor = cursor;
+        self.anchor = anchor;
+        Some((utf16_offset(text, cursor), utf16_offset(text, anchor)))
+    }
+
+    /// Record the snapshot `text`, with the selection from `anchor_utf16` to
+    /// `cursor_utf16` (UTF-16 code units, as `GameTextInput` counts), and
+    /// return the edit that produced it.
+    pub fn update(
+        &mut self,
+        text: &str,
+        anchor_utf16: usize,
+        cursor_utf16: usize,
+    ) -> Option<ImeEdit> {
+        self.anchor = byte_offset(text, anchor_utf16);
         let cursor = byte_offset(text, cursor_utf16);
         let old_cursor = std::mem::replace(&mut self.cursor, cursor);
         if self.text == text {
@@ -70,6 +96,11 @@ fn edit(old: &str, new: &str, cursor: usize) -> ImeEdit {
     ImeEdit { before_bytes: cursor - start, after_bytes: end - cursor, commit }
 }
 
+/// UTF-16 offset of byte `byte` in `text`, clamped to it.
+fn utf16_offset(text: &str, byte: usize) -> usize {
+    text.char_indices().take_while(|(at, _)| *at < byte).map(|(_, ch)| ch.len_utf16()).sum()
+}
+
 /// Byte offset of the UTF-16 offset `units` in `text`, clamped to it.
 fn byte_offset(text: &str, units: usize) -> usize {
     let mut count = 0;
@@ -88,7 +119,7 @@ mod tests {
 
     fn typed(mirror: &mut ImeMirror, text: &str) -> Option<ImeEdit> {
         let caret = text.encode_utf16().count();
-        mirror.update(text, caret)
+        mirror.update(text, caret, caret)
     }
 
     #[test]
@@ -113,9 +144,9 @@ mod tests {
         let mut mirror = ImeMirror::default();
         typed(&mut mirror, "hello world");
         // Caret moved after "hello" (e.g. space-bar cursor drag).
-        assert_eq!(mirror.update("hello world", 5), None);
+        assert_eq!(mirror.update("hello world", 5, 5), None);
         assert_eq!(
-            mirror.update("hellox world", 6),
+            mirror.update("hellox world", 6, 6),
             Some(ImeEdit { before_bytes: 0, after_bytes: 0, commit: "x".into() })
         );
     }
@@ -133,6 +164,20 @@ mod tests {
             typed(&mut mirror, "hello world"),
             Some(ImeEdit { before_bytes: 3, after_bytes: 0, commit: "orld".into() })
         );
+    }
+
+    #[test]
+    fn loaded_text_is_the_new_baseline() {
+        let mut mirror = ImeMirror::default();
+        assert_eq!(mirror.load("día uno", 5, 5), Some((4, 4)));
+        assert_eq!(mirror.load("día uno", 5, 5), None, "already loaded");
+        // The keyboard types after "día " (5 bytes, 4 UTF-16 units).
+        assert_eq!(
+            mirror.update("día xuno", 5, 5),
+            Some(ImeEdit { before_bytes: 0, after_bytes: 0, commit: "x".into() })
+        );
+        // The application echoes the edit back: nothing to reload.
+        assert_eq!(mirror.load("día xuno", 6, 6), None);
     }
 
     #[test]

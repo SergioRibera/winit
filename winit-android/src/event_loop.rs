@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction, TextInputState};
+use android_activity::input::{
+    InputEvent, KeyAction, Keycode, MotionAction, TextInputState, TextSpan,
+};
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
 };
@@ -26,8 +28,8 @@ use winit_core::event_loop::{
 use winit_core::monitor::{Fullscreen, MonitorHandle as CoreMonitorHandle};
 use winit_core::window::{
     self, CursorGrabMode, ImeCapabilities, ImePurpose, ImeRequest, ImeRequestError,
-    ResizeDirection, Theme, Window as CoreWindow, WindowAttributes, WindowButtons, WindowId,
-    WindowLevel,
+    ImeSurroundingText, ResizeDirection, Theme, Window as CoreWindow, WindowAttributes,
+    WindowButtons, WindowId, WindowLevel,
 };
 
 use crate::ime::ImeMirror;
@@ -514,7 +516,8 @@ impl EventLoop {
                 }
             },
             InputEvent::TextEvent(state) => {
-                let edit = ime_mirror().update(&state.text, state.selection.end);
+                let edit =
+                    ime_mirror().update(&state.text, state.selection.start, state.selection.end);
                 if let Some(edit) = edit {
                     if edit.before_bytes > 0 || edit.after_bytes > 0 {
                         app.window_event(
@@ -864,6 +867,31 @@ impl Window {
         })
     }
 
+    /// Load the field's text and selection into `GameTextInput` (and the
+    /// mirror edits are diffed against), or an empty buffer without one.
+    ///
+    /// `GameTextInput` restarts the input connection on every new state and
+    /// the keyboard drops its composing word, so the text is only loaded
+    /// when it differs from what the keyboard already has.
+    fn load_surrounding_text(&self, surrounding: Option<&ImeSurroundingText>) {
+        let Some(surrounding) = surrounding else {
+            ime_mirror().clear();
+            self.app.set_text_input_state(TextInputState::default());
+            return;
+        };
+        let text = surrounding.text();
+        let Some((cursor, anchor)) =
+            ime_mirror().load(text, surrounding.cursor(), surrounding.anchor())
+        else {
+            return;
+        };
+        self.app.set_text_input_state(TextInputState {
+            text: text.to_owned(),
+            selection: TextSpan { start: anchor, end: cursor },
+            compose_region: None,
+        });
+    }
+
     pub(crate) fn config(&self) -> ConfigurationRef {
         self.app.config()
     }
@@ -1037,21 +1065,26 @@ impl CoreWindow for Window {
         let mut current_caps = self.ime_capabilities.lock().unwrap();
         match request {
             ImeRequest::Enable(enable) => {
-                let (capabilities, _) = enable.into_raw();
+                let (capabilities, data) = enable.into_raw();
                 if current_caps.is_some() {
                     return Err(ImeRequestError::AlreadyEnabled);
                 }
                 *current_caps = Some(capabilities);
-                // Reset mirror + GameTextInput buffer so a focus change
-                // between fields doesn't re-attribute the previous field's
-                // text to the new one on first keystroke.
-                ime_mirror().clear();
-                self.app.set_text_input_state(TextInputState::default());
+                // Start from the field's text, or from an empty buffer so a
+                // focus change between fields doesn't re-attribute the
+                // previous field's text to the new one on first keystroke.
+                let surrounding = data.surrounding_text.filter(|_| capabilities.surrounding_text());
+                self.load_surrounding_text(surrounding.as_ref());
                 self.app.show_soft_input(true);
             },
-            ImeRequest::Update(_) => {
-                if current_caps.is_none() {
+            ImeRequest::Update(data) => {
+                let Some(capabilities) = *current_caps else {
                     return Err(ImeRequestError::NotEnabled);
+                };
+                if let Some(surrounding) =
+                    data.surrounding_text.filter(|_| capabilities.surrounding_text())
+                {
+                    self.load_surrounding_text(Some(&surrounding));
                 }
             },
             ImeRequest::Disable => {

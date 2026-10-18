@@ -40,6 +40,11 @@ changelog entry.
 
 ## Unreleased
 
+### Added
+
+- On Android, load `ImeSurroundingText` from `ImeRequest::Enable` and `ImeRequest::Update` into
+  the soft keyboard, so its suggestions and corrections follow the text around the caret.
+
 ### Fixed
 
 - On Windows, fix a crash occurring when trying to create a DXGI surface on a window that is both fullscreen and always on top.
