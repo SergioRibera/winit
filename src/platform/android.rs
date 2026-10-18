@@ -75,6 +75,23 @@ use crate::window::{Window, WindowAttributes};
 
 use self::activity::{AndroidApp, ConfigurationRef, Rect};
 
+/// Tell the soft keyboard the text of the focused field and where the
+/// selection sits in it, from byte `anchor` to byte `cursor` (equal for a
+/// plain caret), so its suggestions, auto-capitalization and corrections
+/// follow what is actually written.
+///
+/// Winit 0.30 has no surrounding-text request, so applications call this
+/// themselves: when a text field gains the focus and whenever its text or
+/// caret change by something other than the keyboard (a tap moving the
+/// caret, a programmatic edit). Edits typed on the keyboard are already
+/// known to it. Each call restarts the input connection.
+pub fn set_ime_surrounding_text(app: &AndroidApp, text: &str, cursor: usize, anchor: usize) {
+    #[cfg(android_platform)]
+    crate::platform_impl::set_ime_surrounding_text(app, text, cursor, anchor);
+    #[cfg(not(android_platform))]
+    let _ = (app, text, cursor, anchor);
+}
+
 /// Additional methods on [`EventLoop`] that are specific to Android.
 pub trait EventLoopExtAndroid {
     /// Get the [`AndroidApp`] which was used to create this event loop.

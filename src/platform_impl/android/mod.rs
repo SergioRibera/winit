@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction, TextInputState};
+use android_activity::input::{
+    InputEvent, KeyAction, Keycode, MotionAction, TextInputState, TextSpan,
+};
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
 };
@@ -36,12 +38,63 @@ static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
 
 /// Last-observed soft-keyboard buffer. `GameTextInput` sends full
 /// buffer snapshots per edit; winit's `Ime::Commit` is delta-based, so
-/// we diff against this mirror. Cleared by `set_ime_allowed(true)` so
-/// a focus change between fields starts from a clean baseline.
+/// we diff against this mirror. Loaded together with the buffer by
+/// [`set_ime_surrounding_text`].
 static IME_TEXT_MIRROR: OnceLock<Mutex<String>> = OnceLock::new();
 
 fn ime_text_mirror() -> &'static Mutex<String> {
     IME_TEXT_MIRROR.get_or_init(|| Mutex::new(String::new()))
+}
+
+/// The edit turning `old` into `new`: how many characters were removed
+/// right before the caret and the text inserted in their place. Edits
+/// happen at the caret, so the text around it is the common prefix and
+/// suffix of both buffers (char-wise: byte-wise would split UTF-8).
+fn ime_edit(old: &str, new: &str) -> (usize, String) {
+    let prefix = old.chars().zip(new.chars()).take_while(|(a, b)| a == b).count();
+    let (old_len, new_len) = (old.chars().count(), new.chars().count());
+    let suffix = old
+        .chars()
+        .rev()
+        .zip(new.chars().rev())
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(old_len.min(new_len) - prefix);
+    let added = new.chars().skip(prefix).take(new_len - prefix - suffix).collect();
+    (old_len - prefix - suffix, added)
+}
+
+/// Whether the soft keyboard was last requested shown. Toolkits call
+/// `set_ime_allowed` on every frame that touches the focused widget; only
+/// the transitions reach `GameActivity`, because resetting the buffer
+/// restarts the input connection and the keyboard loses its state (shift,
+/// symbols page, suggestions).
+static IME_ALLOWED: AtomicBool = AtomicBool::new(false);
+
+/// Load `text` into the `GameTextInput` buffer and its mirror, with the
+/// selection from byte `anchor` to byte `cursor`.
+pub(crate) fn set_ime_surrounding_text(
+    app: &AndroidApp,
+    text: &str,
+    cursor: usize,
+    anchor: usize,
+) {
+    // GameTextInput spans count UTF-16 code units, like Java strings.
+    let utf16 = |byte: usize| {
+        let mut byte = byte.min(text.len());
+        while !text.is_char_boundary(byte) {
+            byte -= 1;
+        }
+        text[..byte].encode_utf16().count()
+    };
+    if let Ok(mut mirror) = ime_text_mirror().lock() {
+        text.clone_into(&mut mirror);
+    }
+    app.set_text_input_state(TextInputState {
+        text: text.to_owned(),
+        selection: TextSpan { start: utf16(anchor), end: utf16(cursor) },
+        compose_region: None,
+    });
 }
 
 /// Returns the minimum `Option<Duration>`, taking into account that `None`
@@ -494,11 +547,7 @@ impl<T: 'static> EventLoop<T> {
                     return InputStatus::Unhandled;
                 }
 
-                // Char-wise LCP: byte-wise would split multi-byte UTF-8.
-                let prefix_chars =
-                    old_text.chars().zip(new_text.chars()).take_while(|(a, b)| a == b).count();
-                let added: String = new_text.chars().skip(prefix_chars).collect();
-                let removed = old_text.chars().count().saturating_sub(prefix_chars);
+                let (removed, added) = ime_edit(&old_text, &new_text);
 
                 let window_id = window::WindowId(WindowId);
                 let device_id = event::DeviceId(DeviceId(0));
@@ -991,14 +1040,11 @@ impl Window {
     pub fn set_ime_cursor_area(&self, _position: Position, _size: Size) {}
 
     pub fn set_ime_allowed(&self, allowed: bool) {
+        if IME_ALLOWED.swap(allowed, Ordering::Relaxed) == allowed {
+            return;
+        }
         if allowed {
-            // Reset mirror + GameTextInput buffer so a focus change
-            // between fields doesn't re-attribute the previous field's
-            // text to the new one on first keystroke.
-            if let Ok(mut mirror) = ime_text_mirror().lock() {
-                mirror.clear();
-            }
-            self.app.set_text_input_state(TextInputState::default());
+            set_ime_surrounding_text(&self.app, "", 0, 0);
             self.app.show_soft_input(true);
         } else {
             self.app.hide_soft_input(true);
