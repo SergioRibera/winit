@@ -66,10 +66,14 @@ pub(crate) fn set_ime_surrounding_text(app: &AndroidApp, text: &str, cursor: usi
     });
 }
 
-/// Forget the keyboard buffer, e.g. when the IME turns on for a new field.
+/// Forget the keyboard buffer, e.g. when the IME turns off.
 fn clear_ime_text(app: &AndroidApp) {
     ime_mirror().clear();
-    app.set_text_input_state(TextInputState::default());
+    app.set_text_input_state(TextInputState {
+        text: String::new(),
+        selection: TextSpan { start: 0, end: 0 },
+        compose_region: None,
+    });
 }
 
 /// Returns the minimum `Option<Duration>`, taking into account that `None`
@@ -1028,9 +1032,13 @@ impl Window {
             return;
         }
         if allowed {
-            clear_ime_text(&self.app);
             self.app.show_soft_input(true);
         } else {
+            // Emptied when the keyboard goes away rather than when it comes
+            // back: the text an application loads for the field it is focusing
+            // ([`set_ime_surrounding_text`]) may arrive before the keyboard turns
+            // on, and must survive it.
+            clear_ime_text(&self.app);
             self.app.hide_soft_input(true);
         }
     }

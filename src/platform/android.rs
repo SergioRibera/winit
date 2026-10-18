@@ -81,7 +81,8 @@ use self::activity::{AndroidApp, ConfigurationRef, Rect};
 /// follow what is actually written.
 ///
 /// Winit 0.30 has no surrounding-text request, so applications call this
-/// themselves: when a text field gains the focus and whenever its text or
+/// themselves: when a text field gains the focus (before or after
+/// [`Window::set_ime_allowed`] turns the keyboard on) and whenever its text or
 /// caret change by something other than the keyboard (a tap moving the
 /// caret, a programmatic edit). Edits typed on the keyboard are already
 /// known to it. Each call that changes what the keyboard has restarts the
