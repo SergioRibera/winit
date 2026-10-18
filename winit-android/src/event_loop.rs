@@ -30,18 +30,18 @@ use winit_core::window::{
     WindowLevel,
 };
 
+use crate::ime::ImeMirror;
 use crate::keycodes;
 
 static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
 
-/// Last-observed soft-keyboard buffer. `GameTextInput` sends full
-/// buffer snapshots per edit; winit's `Ime::Commit` is delta-based, so
-/// we diff against this mirror. Cleared by `ImeRequest::Enable` so a
-/// focus change between fields starts from a clean baseline.
-static IME_TEXT_MIRROR: OnceLock<Mutex<String>> = OnceLock::new();
+/// Last-observed soft-keyboard buffer, see [`ImeMirror`]. Cleared by
+/// `ImeRequest::Enable` so a focus change between fields starts from a
+/// clean baseline.
+static IME_MIRROR: OnceLock<Mutex<ImeMirror>> = OnceLock::new();
 
-fn ime_text_mirror() -> &'static Mutex<String> {
-    IME_TEXT_MIRROR.get_or_init(|| Mutex::new(String::new()))
+fn ime_mirror() -> std::sync::MutexGuard<'static, ImeMirror> {
+    IME_MIRROR.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Returns the minimum `Option<Duration>`, taking into account that `None`
@@ -514,36 +514,20 @@ impl EventLoop {
                 }
             },
             InputEvent::TextEvent(state) => {
-                let new_text = state.text.clone();
-                let old_text = {
-                    let mut guard = ime_text_mirror().lock().unwrap_or_else(|e| e.into_inner());
-                    std::mem::replace(&mut *guard, new_text.clone())
-                };
-
-                if new_text != old_text {
-                    // Char-wise LCP: byte-wise would split multi-byte UTF-8.
-                    let prefix_chars = old_text
-                        .chars()
-                        .zip(new_text.chars())
-                        .take_while(|(a, b)| a == b)
-                        .count();
-                    let prefix_bytes: usize =
-                        old_text.chars().take(prefix_chars).map(char::len_utf8).sum();
-                    let removed_bytes = old_text.len() - prefix_bytes;
-                    let added = &new_text[prefix_bytes..];
-
-                    if removed_bytes > 0 {
+                let edit = ime_mirror().update(&state.text, state.selection.end);
+                if let Some(edit) = edit {
+                    if edit.before_bytes > 0 || edit.after_bytes > 0 {
                         app.window_event(
                             &self.window_target,
                             GLOBAL_WINDOW,
                             event::WindowEvent::Ime(event::Ime::DeleteSurrounding {
-                                before_bytes: removed_bytes,
-                                after_bytes: 0,
+                                before_bytes: edit.before_bytes,
+                                after_bytes: edit.after_bytes,
                             }),
                         );
                     }
 
-                    if !added.is_empty() {
+                    if !edit.commit.is_empty() {
                         // `Ime::Commit` docstring requires an empty `Preedit` right before.
                         app.window_event(
                             &self.window_target,
@@ -553,7 +537,7 @@ impl EventLoop {
                         app.window_event(
                             &self.window_target,
                             GLOBAL_WINDOW,
-                            event::WindowEvent::Ime(event::Ime::Commit(added.to_owned())),
+                            event::WindowEvent::Ime(event::Ime::Commit(edit.commit)),
                         );
                     }
                 }
@@ -1061,9 +1045,7 @@ impl CoreWindow for Window {
                 // Reset mirror + GameTextInput buffer so a focus change
                 // between fields doesn't re-attribute the previous field's
                 // text to the new one on first keystroke.
-                if let Ok(mut mirror) = ime_text_mirror().lock() {
-                    mirror.clear();
-                }
+                ime_mirror().clear();
                 self.app.set_text_input_state(TextInputState::default());
                 self.app.show_soft_input(true);
             },
