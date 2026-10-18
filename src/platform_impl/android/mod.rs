@@ -534,13 +534,19 @@ impl<T: 'static> EventLoop<T> {
                     ))
                     .take(edit.after),
                 );
-                for (code, named) in deletes {
+                // Not `is_synthetic`: the user pressed these keys on the soft
+                // keyboard, and toolkits drop synthetic presses (they stand for
+                // keys held while the window gained focus).
+                let states = [event::ElementState::Pressed, event::ElementState::Released];
+                for ((code, named), state) in
+                    deletes.flat_map(|key| states.into_iter().map(move |state| (key, state)))
+                {
                     let event = event::Event::WindowEvent {
                         window_id,
                         event: event::WindowEvent::KeyboardInput {
                             device_id,
                             event: event::KeyEvent {
-                                state: event::ElementState::Pressed,
+                                state,
                                 physical_key: crate::keyboard::PhysicalKey::Code(code),
                                 logical_key: crate::keyboard::Key::Named(named),
                                 location: crate::keyboard::KeyLocation::Standard,
@@ -548,7 +554,7 @@ impl<T: 'static> EventLoop<T> {
                                 text: None,
                                 platform_specific: KeyEventExtra {},
                             },
-                            is_synthetic: true,
+                            is_synthetic: false,
                         },
                     };
                     callback(event, self.window_target());
