@@ -84,7 +84,8 @@ use self::activity::{AndroidApp, ConfigurationRef, Rect};
 /// themselves: when a text field gains the focus and whenever its text or
 /// caret change by something other than the keyboard (a tap moving the
 /// caret, a programmatic edit). Edits typed on the keyboard are already
-/// known to it. Each call restarts the input connection.
+/// known to it. Each call that changes what the keyboard has restarts the
+/// input connection; repeating the current state is a no-op.
 pub fn set_ime_surrounding_text(app: &AndroidApp, text: &str, cursor: usize, anchor: usize) {
     #[cfg(android_platform)]
     crate::platform_impl::set_ime_surrounding_text(app, text, cursor, anchor);

@@ -27,6 +27,7 @@ use crate::window::{
     WindowButtons, WindowLevel,
 };
 
+mod ime;
 mod keycodes;
 
 pub(crate) use crate::cursor::{
@@ -36,65 +37,39 @@ pub(crate) use crate::icon::NoIcon as PlatformIcon;
 
 static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
 
-/// Last-observed soft-keyboard buffer. `GameTextInput` sends full
-/// buffer snapshots per edit; winit's `Ime::Commit` is delta-based, so
-/// we diff against this mirror. Loaded together with the buffer by
-/// [`set_ime_surrounding_text`].
-static IME_TEXT_MIRROR: OnceLock<Mutex<String>> = OnceLock::new();
+/// Last-observed soft-keyboard buffer, see [`ime::ImeMirror`].
+static IME_MIRROR: OnceLock<Mutex<ime::ImeMirror>> = OnceLock::new();
 
-fn ime_text_mirror() -> &'static Mutex<String> {
-    IME_TEXT_MIRROR.get_or_init(|| Mutex::new(String::new()))
-}
-
-/// The edit turning `old` into `new`: how many characters were removed
-/// right before the caret and the text inserted in their place. Edits
-/// happen at the caret, so the text around it is the common prefix and
-/// suffix of both buffers (char-wise: byte-wise would split UTF-8).
-fn ime_edit(old: &str, new: &str) -> (usize, String) {
-    let prefix = old.chars().zip(new.chars()).take_while(|(a, b)| a == b).count();
-    let (old_len, new_len) = (old.chars().count(), new.chars().count());
-    let suffix = old
-        .chars()
-        .rev()
-        .zip(new.chars().rev())
-        .take_while(|(a, b)| a == b)
-        .count()
-        .min(old_len.min(new_len) - prefix);
-    let added = new.chars().skip(prefix).take(new_len - prefix - suffix).collect();
-    (old_len - prefix - suffix, added)
+fn ime_mirror() -> std::sync::MutexGuard<'static, ime::ImeMirror> {
+    IME_MIRROR.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Whether the soft keyboard was last requested shown. Toolkits call
 /// `set_ime_allowed` on every frame that touches the focused widget; only
-/// the transitions reach `GameActivity`, because resetting the buffer
+/// the transitions reach `GameActivity`, because a new buffer state
 /// restarts the input connection and the keyboard loses its state (shift,
 /// symbols page, suggestions).
 static IME_ALLOWED: AtomicBool = AtomicBool::new(false);
 
 /// Load `text` into the `GameTextInput` buffer and its mirror, with the
-/// selection from byte `anchor` to byte `cursor`.
-pub(crate) fn set_ime_surrounding_text(
-    app: &AndroidApp,
-    text: &str,
-    cursor: usize,
-    anchor: usize,
-) {
-    // GameTextInput spans count UTF-16 code units, like Java strings.
-    let utf16 = |byte: usize| {
-        let mut byte = byte.min(text.len());
-        while !text.is_char_boundary(byte) {
-            byte -= 1;
-        }
-        text[..byte].encode_utf16().count()
+/// selection from byte `anchor` to byte `cursor`. Skipped when the keyboard
+/// already has that state (an application echoing back an edit the keyboard
+/// just made): every new state restarts the input connection.
+pub(crate) fn set_ime_surrounding_text(app: &AndroidApp, text: &str, cursor: usize, anchor: usize) {
+    let Some((cursor, anchor)) = ime_mirror().load(text, cursor, anchor) else {
+        return;
     };
-    if let Ok(mut mirror) = ime_text_mirror().lock() {
-        text.clone_into(&mut mirror);
-    }
     app.set_text_input_state(TextInputState {
         text: text.to_owned(),
-        selection: TextSpan { start: utf16(anchor), end: utf16(cursor) },
+        selection: TextSpan { start: anchor, end: cursor },
         compose_region: None,
     });
+}
+
+/// Forget the keyboard buffer, e.g. when the IME turns on for a new field.
+fn clear_ime_text(app: &AndroidApp) {
+    ime_mirror().clear();
+    app.set_text_input_state(TextInputState::default());
 }
 
 /// Returns the minimum `Option<Duration>`, taking into account that `None`
@@ -537,34 +512,37 @@ impl<T: 'static> EventLoop<T> {
                 }
             },
             InputEvent::TextEvent(state) => {
-                let new_text = state.text.clone();
-                let old_text = {
-                    let mut guard = ime_text_mirror().lock().unwrap_or_else(|e| e.into_inner());
-                    std::mem::replace(&mut *guard, new_text.clone())
-                };
-
-                if new_text == old_text {
+                let edit =
+                    ime_mirror().update(&state.text, state.selection.start, state.selection.end);
+                let Some(edit) = edit else {
                     return InputStatus::Unhandled;
-                }
-
-                let (removed, added) = ime_edit(&old_text, &new_text);
+                };
 
                 let window_id = window::WindowId(WindowId);
                 let device_id = event::DeviceId(DeviceId(0));
 
-                for _ in 0..removed {
+                // 0.30 has no `Ime::DeleteSurrounding`: delete with key presses.
+                let deletes = std::iter::repeat((
+                    crate::keyboard::KeyCode::Backspace,
+                    crate::keyboard::NamedKey::Backspace,
+                ))
+                .take(edit.before)
+                .chain(
+                    std::iter::repeat((
+                        crate::keyboard::KeyCode::Delete,
+                        crate::keyboard::NamedKey::Delete,
+                    ))
+                    .take(edit.after),
+                );
+                for (code, named) in deletes {
                     let event = event::Event::WindowEvent {
                         window_id,
                         event: event::WindowEvent::KeyboardInput {
                             device_id,
                             event: event::KeyEvent {
                                 state: event::ElementState::Pressed,
-                                physical_key: crate::keyboard::PhysicalKey::Code(
-                                    crate::keyboard::KeyCode::Backspace,
-                                ),
-                                logical_key: crate::keyboard::Key::Named(
-                                    crate::keyboard::NamedKey::Backspace,
-                                ),
+                                physical_key: crate::keyboard::PhysicalKey::Code(code),
+                                logical_key: crate::keyboard::Key::Named(named),
                                 location: crate::keyboard::KeyLocation::Standard,
                                 repeat: false,
                                 text: None,
@@ -576,7 +554,7 @@ impl<T: 'static> EventLoop<T> {
                     callback(event, self.window_target());
                 }
 
-                if !added.is_empty() {
+                if !edit.commit.is_empty() {
                     // `Ime::Commit` docstring requires an empty `Preedit` right before.
                     callback(
                         event::Event::WindowEvent {
@@ -591,7 +569,7 @@ impl<T: 'static> EventLoop<T> {
                     callback(
                         event::Event::WindowEvent {
                             window_id,
-                            event: event::WindowEvent::Ime(event::Ime::Commit(added)),
+                            event: event::WindowEvent::Ime(event::Ime::Commit(edit.commit)),
                         },
                         self.window_target(),
                     );
@@ -1044,7 +1022,7 @@ impl Window {
             return;
         }
         if allowed {
-            set_ime_surrounding_text(&self.app, "", 0, 0);
+            clear_ime_text(&self.app);
             self.app.show_soft_input(true);
         } else {
             self.app.hide_soft_input(true);
