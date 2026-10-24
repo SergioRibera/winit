@@ -247,6 +247,10 @@ impl App {
                     error!("Buggy IME tried to delete with indices not on char boundary.");
                 }
             },
+            Ime::Selection { cursor_bytes, anchor_bytes } => {
+                // This text field has no selection and keeps its cursor at the end.
+                info!("IME moved the selection: cursor {cursor_bytes:+}, anchor {anchor_bytes:+}");
+            },
             Ime::Disabled => info!("IME disabled for Window={:?}", surface.window().id()),
         }
     }

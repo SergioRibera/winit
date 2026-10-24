@@ -42,5 +42,7 @@ changelog entry.
 
 ### Added
 
+- Add `Ime::Selection` to let the input method move the cursor and the selection, implemented on
+  Android.
 - On Android, report soft keyboard input from `GameActivity` as `WindowEvent::Ime` events, with
   the composing text as `Ime::Preedit`, and load `ImeSurroundingText` into the keyboard.

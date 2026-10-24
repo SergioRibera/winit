@@ -169,6 +169,17 @@ impl ImeState {
         preedit.clone_into(&mut self.preedit);
         self.preedit_cursor = preedit_cursor;
 
+        // Without a preedit the snapshot selection is in the text of the field, and the keyboard
+        // may have moved it on its own, e.g. when the user drags the cursor with the space bar.
+        if preedit.is_empty() && (cursor, anchor) != (self.cursor, self.anchor) {
+            events.push(Ime::Selection {
+                cursor_bytes: cursor as isize - self.cursor as isize,
+                anchor_bytes: anchor as isize - self.cursor as isize,
+            });
+            self.cursor = cursor;
+            self.anchor = anchor;
+        }
+
         events
     }
 
@@ -371,14 +382,37 @@ mod tests {
         assert_eq!(events, [Ime::Preedit("cd".into(), None)]);
     }
 
+    fn selection(cursor_bytes: isize, anchor_bytes: isize) -> Ime {
+        Ime::Selection { cursor_bytes, anchor_bytes }
+    }
+
     #[test]
-    fn caret_moves_alone_send_nothing() {
+    fn caret_moves_are_reported_as_selection_changes() {
         let mut state = ImeState::default();
         typed(&mut state, "hello world");
-        assert!(state.update(snapshot("hello world", 5)).is_empty());
-        // The application still has the caret at the end: the edit is widened to reach it.
-        assert_eq!(state.update(snapshot("hellox world", 6)), [delete(6, 0), commit("x world")]);
+        // Space bar drag back to after "hello".
+        assert_eq!(state.update(snapshot("hello world", 5)), [selection(-6, -6)]);
+        assert_eq!(state.update(snapshot("hellox world", 6)), [commit("x")]);
         assert_eq!(state.text, "hellox world");
+    }
+
+    #[test]
+    fn keyboard_selections_are_reported_from_the_cursor() {
+        let mut state = ImeState::default();
+        state.load("día uno", 5, 5);
+        // The keyboard selects "uno" with the caret at its end.
+        let events =
+            state.update(Snapshot { text: "día uno", anchor: 4, cursor: 7, compose: None });
+        assert_eq!(events, [selection(3, 0)]);
+        // Typing replaces it.
+        assert_eq!(typed(&mut state, "día x"), [commit("x")]);
+    }
+
+    #[test]
+    fn a_commit_that_leaves_the_caret_where_expected_moves_nothing() {
+        let mut state = ImeState::default();
+        typed(&mut state, "ab");
+        assert_eq!(typed(&mut state, "abc"), [commit("c")]);
     }
 
     #[test]

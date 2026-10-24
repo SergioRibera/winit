@@ -1106,6 +1106,29 @@ pub enum Ime {
         after_bytes: usize,
     },
 
+    /// Notifies when the input method moved the cursor or changed the selection.
+    ///
+    /// Soft keyboards do this when the user drags the cursor with the space bar, or uses
+    /// the selection tools of the keyboard.
+    ///
+    /// Both positions are byte offsets from the current cursor position, so the new cursor is
+    /// at `cursor + cursor_bytes` and the other end of the selection at `cursor + anchor_bytes`.
+    /// Both offsets are equal when nothing is selected.
+    ///
+    /// This event is not sent while there is a pre-edit.
+    ///
+    /// This event assumes text is stored in UTF-8.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **iOS / macOS / Wayland / Web / Windows / X11 / Orbital:** Unsupported.
+    Selection {
+        /// The new position of the cursor, relative to the current one.
+        cursor_bytes: isize,
+        /// The new position of the other end of the selection, relative to the current cursor.
+        anchor_bytes: isize,
+    },
+
     /// Notifies when the IME was disabled.
     ///
     /// After receiving this event you won't get any more [`Preedit`][Self::Preedit] or
