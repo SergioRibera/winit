@@ -439,6 +439,12 @@ impl ApplicationHandler<UserEvent> for Application {
                 Ime::Commit(text) => {
                     info!("Committed: {}", text);
                 },
+                Ime::DeleteSurrounding { before_bytes, after_bytes } => {
+                    info!("Delete {before_bytes} bytes before and {after_bytes} after");
+                },
+                Ime::Selection { cursor_bytes, anchor_bytes } => {
+                    info!("Selection moved: cursor {cursor_bytes:+}, anchor {anchor_bytes:+}");
+                },
                 Ime::Disabled => info!("IME disabled for Window={window_id:?}"),
             },
             WindowEvent::PinchGesture { delta, .. } => {

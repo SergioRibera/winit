@@ -3,11 +3,12 @@ use std::collections::VecDeque;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use android_activity::input::{
-    InputEvent, KeyAction, Keycode, MotionAction, TextInputState, TextSpan,
+    ImeOptions, InputEvent, InputType, InputTypeClass, KeyAction, Keycode, MotionAction,
+    TextInputAction, TextInputState, TextSpan,
 };
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
@@ -23,8 +24,8 @@ use crate::event_loop::{self, ActiveEventLoop as RootAEL, ControlFlow, DeviceEve
 use crate::platform::pump_events::PumpStatus;
 use crate::platform_impl::Fullscreen;
 use crate::window::{
-    self, CursorGrabMode, CustomCursor, CustomCursorSource, ImePurpose, ResizeDirection, Theme,
-    WindowButtons, WindowLevel,
+    self, CursorGrabMode, CustomCursor, CustomCursorSource, ImeHint, ImePurpose, ResizeDirection,
+    Theme, WindowButtons, WindowLevel,
 };
 
 mod ime;
@@ -37,38 +38,57 @@ pub(crate) use crate::icon::NoIcon as PlatformIcon;
 
 static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
 
-/// Last-observed soft-keyboard buffer, see [`ime::ImeMirror`].
-static IME_MIRROR: OnceLock<Mutex<ime::ImeMirror>> = OnceLock::new();
+/// The text field as the application knows it, see [`ime::ImeState`].
+static IME_STATE: OnceLock<Mutex<ime::ImeState>> = OnceLock::new();
 
-fn ime_mirror() -> std::sync::MutexGuard<'static, ime::ImeMirror> {
-    IME_MIRROR.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner())
+fn ime_state() -> MutexGuard<'static, ime::ImeState> {
+    IME_STATE.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Whether the soft keyboard was last requested shown. Toolkits call
-/// `set_ime_allowed` on every frame that touches the focused widget; only
-/// the transitions reach `GameActivity`, because a new buffer state
-/// restarts the input connection and the keyboard loses its state (shift,
-/// symbols page, suggestions).
-static IME_ALLOWED: AtomicBool = AtomicBool::new(false);
+/// The hint and purpose of the focused field, and those the keyboard was last configured for.
+static IME_FIELD: Mutex<ImeField> =
+    Mutex::new(ImeField { hint: ImeHint::NONE, purpose: ImePurpose::Normal, applied: None });
 
-/// Load `text` into the `GameTextInput` buffer and its mirror, with the
-/// selection from byte `anchor` to byte `cursor`. Skipped when the keyboard
-/// already has that state (an application echoing back an edit the keyboard
-/// just made): every new state restarts the input connection.
+struct ImeField {
+    hint: ImeHint,
+    purpose: ImePurpose,
+    applied: Option<(ImeHint, ImePurpose)>,
+}
+
+fn ime_field() -> MutexGuard<'static, ImeField> {
+    IME_FIELD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl ImeField {
+    /// Configure the keyboard for the focused field. `GameTextInput` restarts the input
+    /// connection on every new configuration, so it is skipped when nothing changed.
+    fn apply(&mut self, app: &AndroidApp) {
+        if self.applied == Some((self.hint, self.purpose)) {
+            return;
+        }
+        self.applied = Some((self.hint, self.purpose));
+        let (input_type, action, options) = editor_info(self.hint, self.purpose);
+        app.set_ime_editor_info(input_type, action, options);
+    }
+}
+
+/// Load `text` into the `GameTextInput` buffer, with the selection from byte `anchor` to byte
+/// `cursor`. Skipped when the keyboard already has that state (an application echoing back an
+/// edit the keyboard just made): every new state restarts the input connection.
 pub(crate) fn set_ime_surrounding_text(app: &AndroidApp, text: &str, cursor: usize, anchor: usize) {
-    let Some((cursor, anchor)) = ime_mirror().load(text, cursor, anchor) else {
+    let Some(buffer) = ime_state().load(text, cursor, anchor) else {
         return;
     };
     app.set_text_input_state(TextInputState {
-        text: text.to_owned(),
-        selection: TextSpan { start: anchor, end: cursor },
-        compose_region: None,
+        text: buffer.text,
+        selection: TextSpan { start: buffer.anchor, end: buffer.cursor },
+        compose_region: buffer.compose.map(|(start, end)| TextSpan { start, end }),
     });
 }
 
 /// Forget the keyboard buffer, e.g. when the IME turns off.
 fn clear_ime_text(app: &AndroidApp) {
-    ime_mirror().clear();
+    ime_state().disable();
     app.set_text_input_state(TextInputState {
         text: String::new(),
         selection: TextSpan { start: 0, end: 0 },
@@ -364,6 +384,8 @@ impl<T: 'static> EventLoop<T> {
             },
         }
 
+        self.report_ime_status_change(callback);
+
         // Empty the user event buffer
         {
             while let Ok(event) = self.user_events_receiver.try_recv() {
@@ -516,73 +538,61 @@ impl<T: 'static> EventLoop<T> {
                 }
             },
             InputEvent::TextEvent(state) => {
-                let edit =
-                    ime_mirror().update(&state.text, state.selection.start, state.selection.end);
-                let Some(edit) = edit else {
+                if !ime_state().is_enabled() {
+                    // The keyboard may still report its buffer while it goes away.
                     return InputStatus::Unhandled;
+                }
+                self.report_ime_status_change(callback);
+
+                let snapshot = ime::Snapshot {
+                    text: &state.text,
+                    anchor: state.selection.start,
+                    cursor: state.selection.end,
+                    compose: state.compose_region.map(|span| (span.start, span.end)),
                 };
-
-                let window_id = window::WindowId(WindowId);
-                let device_id = event::DeviceId(DeviceId(0));
-
-                // 0.30 has no `Ime::DeleteSurrounding`: delete with key presses.
-                let deletes = std::iter::repeat((
-                    crate::keyboard::KeyCode::Backspace,
-                    crate::keyboard::NamedKey::Backspace,
-                ))
-                .take(edit.before)
-                .chain(
-                    std::iter::repeat((
-                        crate::keyboard::KeyCode::Delete,
-                        crate::keyboard::NamedKey::Delete,
-                    ))
-                    .take(edit.after),
-                );
-                // Not `is_synthetic`: the user pressed these keys on the soft
-                // keyboard, and toolkits drop synthetic presses (they stand for
-                // keys held while the window gained focus).
-                let states = [event::ElementState::Pressed, event::ElementState::Released];
-                for ((code, named), state) in
-                    deletes.flat_map(|key| states.into_iter().map(move |state| (key, state)))
+                let mut events = ime_state().update(snapshot);
+                // `Ime::Commit` promises an empty `Preedit` right before it.
+                let clears_preedit =
+                    matches!(events.first(), Some(event::Ime::Preedit(text, _)) if text.is_empty());
+                if !clears_preedit && events.iter().any(|ime| matches!(ime, event::Ime::Commit(_)))
                 {
+                    events.insert(0, event::Ime::Preedit(String::new(), None));
+                }
+                for ime in events {
                     let event = event::Event::WindowEvent {
-                        window_id,
+                        window_id: window::WindowId(WindowId),
+                        event: event::WindowEvent::Ime(ime),
+                    };
+                    callback(event, self.window_target());
+                }
+            },
+            InputEvent::TextAction(action) => {
+                // The action key of the soft keyboard ("Done", "Go", "Search"...). `GameTextInput`
+                // turns the return key of single line fields into an action, so report it as the
+                // return key it stands for.
+                debug!("Soft keyboard action {action:?}");
+                for state in [event::ElementState::Pressed, event::ElementState::Released] {
+                    let event = event::Event::WindowEvent {
+                        window_id: window::WindowId(WindowId),
                         event: event::WindowEvent::KeyboardInput {
-                            device_id,
+                            device_id: event::DeviceId(DeviceId(0)),
                             event: event::KeyEvent {
                                 state,
-                                physical_key: crate::keyboard::PhysicalKey::Code(code),
-                                logical_key: crate::keyboard::Key::Named(named),
+                                physical_key: crate::keyboard::PhysicalKey::Code(
+                                    crate::keyboard::KeyCode::Enter,
+                                ),
+                                logical_key: crate::keyboard::Key::Named(
+                                    crate::keyboard::NamedKey::Enter,
+                                ),
                                 location: crate::keyboard::KeyLocation::Standard,
                                 repeat: false,
-                                text: None,
+                                text: state.is_pressed().then(|| "\r".into()),
                                 platform_specific: KeyEventExtra {},
                             },
                             is_synthetic: false,
                         },
                     };
                     callback(event, self.window_target());
-                }
-
-                if !edit.commit.is_empty() {
-                    // `Ime::Commit` docstring requires an empty `Preedit` right before.
-                    callback(
-                        event::Event::WindowEvent {
-                            window_id,
-                            event: event::WindowEvent::Ime(event::Ime::Preedit(
-                                String::new(),
-                                None,
-                            )),
-                        },
-                        self.window_target(),
-                    );
-                    callback(
-                        event::Event::WindowEvent {
-                            window_id,
-                            event: event::WindowEvent::Ime(event::Ime::Commit(edit.commit)),
-                        },
-                        self.window_target(),
-                    );
                 }
             },
             _ => {
@@ -591,6 +601,19 @@ impl<T: 'static> EventLoop<T> {
         }
 
         input_status
+    }
+
+    fn report_ime_status_change<F>(&mut self, callback: &mut F)
+    where
+        F: FnMut(event::Event<T>, &RootAEL),
+    {
+        if let Some(ime) = ime_state().take_status_change() {
+            let event = event::Event::WindowEvent {
+                window_id: window::WindowId(WindowId),
+                event: event::WindowEvent::Ime(ime),
+            };
+            callback(event, self.window_target());
+        }
     }
 
     pub fn run<F>(mut self, event_handler: F) -> Result<(), EventLoopError>
@@ -1028,22 +1051,56 @@ impl Window {
     pub fn set_ime_cursor_area(&self, _position: Position, _size: Size) {}
 
     pub fn set_ime_allowed(&self, allowed: bool) {
-        if IME_ALLOWED.swap(allowed, Ordering::Relaxed) == allowed {
+        // Toolkits call this on every frame that touches the focused widget; only the
+        // transitions reach `GameActivity`, because a new buffer state restarts the input
+        // connection and the keyboard loses its state (shift, symbols page, suggestions).
+        let mut ime = ime_state();
+        if ime.is_enabled() == allowed {
             return;
         }
         if allowed {
+            ime.enable();
+            drop(ime);
+            ime_field().apply(&self.app);
             self.app.show_soft_input(true);
         } else {
-            // Emptied when the keyboard goes away rather than when it comes
-            // back: the text an application loads for the field it is focusing
-            // ([`set_ime_surrounding_text`]) may arrive before the keyboard turns
-            // on, and must survive it.
+            drop(ime);
+            // Emptied when the keyboard goes away rather than when it comes back: the text an
+            // application loads for the field it is focusing ([`set_ime_surrounding_text`]) may
+            // arrive before the keyboard turns on, and must survive it.
             clear_ime_text(&self.app);
             self.app.hide_soft_input(true);
         }
+        self.redraw_requester.waker.wake();
     }
 
-    pub fn set_ime_purpose(&self, _purpose: ImePurpose) {}
+    pub fn set_ime_purpose(&self, purpose: ImePurpose) {
+        let mut field = ime_field();
+        field.purpose = purpose;
+        if ime_state().is_enabled() {
+            field.apply(&self.app);
+        }
+    }
+
+    pub fn set_ime_hint(&self, hint: ImeHint) {
+        let mut field = ime_field();
+        field.hint = hint;
+        if ime_state().is_enabled() {
+            field.apply(&self.app);
+        }
+    }
+
+    pub fn set_ime_surrounding_text(&self, text: &str, cursor: usize, anchor: usize) {
+        set_ime_surrounding_text(&self.app, text, cursor, anchor);
+    }
+
+    /// Bring the soft keyboard back while a field is focused, e.g. after the user hid it with the
+    /// back button and tapped the field again.
+    pub fn show_ime(&self) {
+        if ime_state().is_enabled() {
+            self.app.show_soft_input(true);
+        }
+    }
 
     pub fn focus_window(&self) {}
 
@@ -1258,4 +1315,74 @@ impl VideoModeHandle {
     pub fn monitor(&self) -> MonitorHandle {
         self.monitor.clone()
     }
+}
+
+/// The `EditorInfo` describing a text field with `hint` and `purpose` to the keyboard.
+fn editor_info(hint: ImeHint, purpose: ImePurpose) -> (InputType, TextInputAction, ImeOptions) {
+    let mut input_type = match purpose {
+        ImePurpose::Password => {
+            InputType::TYPE_CLASS_TEXT | InputType::TYPE_TEXT_VARIATION_PASSWORD
+        },
+        ImePurpose::Number => {
+            InputType::TYPE_CLASS_NUMBER
+                | InputType::TYPE_NUMBER_FLAG_DECIMAL
+                | InputType::TYPE_NUMBER_FLAG_SIGNED
+        },
+        ImePurpose::Pin => InputType::TYPE_CLASS_NUMBER | InputType::TYPE_NUMBER_VARIATION_PASSWORD,
+        ImePurpose::Phone => InputType::TYPE_CLASS_PHONE,
+        ImePurpose::Url => InputType::TYPE_CLASS_TEXT | InputType::TYPE_TEXT_VARIATION_URI,
+        ImePurpose::Email => {
+            InputType::TYPE_CLASS_TEXT | InputType::TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+        },
+        ImePurpose::Date => {
+            InputType::TYPE_CLASS_DATETIME | InputType::TYPE_DATETIME_VARIATION_DATE
+        },
+        ImePurpose::Time => {
+            InputType::TYPE_CLASS_DATETIME | InputType::TYPE_DATETIME_VARIATION_TIME
+        },
+        ImePurpose::DateTime => InputType::TYPE_CLASS_DATETIME,
+        // Terminals do their own completion, and corrections would rewrite commands.
+        ImePurpose::Terminal => {
+            InputType::TYPE_CLASS_TEXT | InputType::TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        },
+        ImePurpose::Normal => InputType::TYPE_CLASS_TEXT,
+    };
+    // Extracted text mode would show the `GameTextInput` buffer in a full screen editor, but that
+    // buffer only holds the surrounding text the application provided, if any.
+    let mut options = ImeOptions::IME_FLAG_NO_FULLSCREEN;
+    let mut action = TextInputAction::Unspecified;
+
+    if input_type.class() == InputTypeClass::Text {
+        if hint.contains(ImeHint::SPELLCHECK) {
+            input_type |= InputType::TYPE_TEXT_FLAG_AUTO_CORRECT;
+        }
+        if hint.contains(ImeHint::UPPERCASE) {
+            input_type |= InputType::TYPE_TEXT_FLAG_CAP_CHARACTERS;
+        } else if hint.contains(ImeHint::TITLECASE) {
+            input_type |= InputType::TYPE_TEXT_FLAG_CAP_WORDS;
+        } else if hint.contains(ImeHint::AUTO_CAPITALIZATION) {
+            input_type |= InputType::TYPE_TEXT_FLAG_CAP_SENTENCES;
+        }
+        if hint.contains(ImeHint::HIDDEN_TEXT) && purpose != ImePurpose::Password {
+            input_type.remove(InputType::TYPE_MASK_VARIATION);
+            input_type |= InputType::TYPE_TEXT_VARIATION_PASSWORD;
+        }
+        if hint.contains(ImeHint::MULTILINE) {
+            // The return key types a line break instead of performing an action.
+            input_type |= InputType::TYPE_TEXT_FLAG_MULTI_LINE;
+            options |= ImeOptions::IME_FLAG_NO_ENTER_ACTION;
+            action = TextInputAction::None;
+        }
+    }
+    if hint.contains(ImeHint::SENSITIVE_DATA) {
+        if input_type.class() == InputTypeClass::Text {
+            input_type |= InputType::TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+        }
+        options |= ImeOptions::IME_FLAG_NO_PERSONALIZED_LEARNING;
+    }
+    if hint.contains(ImeHint::LATIN) {
+        options |= ImeOptions::IME_FLAG_FORCE_ASCII;
+    }
+
+    (input_type, action, options)
 }

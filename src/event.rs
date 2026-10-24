@@ -793,6 +793,41 @@ pub enum Ime {
     /// Right before this event winit will send empty [`Self::Preedit`] event.
     Commit(String),
 
+    /// Delete text surrounding the cursor or selection.
+    ///
+    /// This event does not affect the pre-edit string. This means that the application must
+    /// first remove the pre-edit, then execute the deletion, then insert the removed text back.
+    ///
+    /// This event assumes text is stored in UTF-8.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - Only sent on Android.
+    DeleteSurrounding {
+        /// Bytes to remove before the selection
+        before_bytes: usize,
+        /// Bytes to remove after the selection
+        after_bytes: usize,
+    },
+
+    /// Notifies when the input method moved the cursor or changed the selection.
+    ///
+    /// Both positions are byte offsets from the current cursor position, so the new cursor is
+    /// at `cursor + cursor_bytes` and the other end of the selection at `cursor + anchor_bytes`.
+    /// Both offsets are equal when nothing is selected.
+    ///
+    /// This event is not sent while there is a pre-edit.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - Only sent on Android.
+    Selection {
+        /// The new position of the cursor, relative to the current one.
+        cursor_bytes: isize,
+        /// The new position of the other end of the selection, relative to the current cursor.
+        anchor_bytes: isize,
+    },
+
     /// Notifies when the IME was disabled.
     ///
     /// After receiving this event you won't get any more [`Preedit`][Self::Preedit] or

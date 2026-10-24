@@ -1836,6 +1836,58 @@ pub enum ImePurpose {
     ///
     /// For example, that could alter OSK on Wayland to show extra buttons.
     Terminal,
+    /// Number (including decimal separator and sign)
+    Number,
+    /// Phone number
+    Phone,
+    /// URL
+    Url,
+    /// Email address
+    Email,
+    /// Password composed only of digits (treated as sensitive data)
+    Pin,
+    /// Date
+    Date,
+    /// Time
+    Time,
+    /// Date and time
+    DateTime,
+}
+
+bitflags::bitflags! {
+    /// IME hints
+    ///
+    /// The hint should reflect the desired behaviour of the IME while entering text, beyond the
+    /// general data type specified in [`ImePurpose`].
+    ///
+    /// ## Platform-specific
+    ///
+    /// - Only used on Android, see `WindowExtAndroid::set_ime_hint`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+    pub struct ImeHint: u32 {
+        /// No special behaviour.
+        const NONE = 0;
+        /// Suggest word completions.
+        const COMPLETION = 0x1;
+        /// Suggest word corrections.
+        const SPELLCHECK = 0x2;
+        /// Switch to uppercase letters at the start of a sentence.
+        const AUTO_CAPITALIZATION = 0x4;
+        /// Prefer lowercase letters.
+        const LOWERCASE = 0x8;
+        /// Prefer uppercase letters.
+        const UPPERCASE = 0x10;
+        /// Prefer casing for titles and headings (can be language dependent).
+        const TITLECASE = 0x20;
+        /// Characters should be hidden.
+        const HIDDEN_TEXT = 0x40;
+        /// Typed text should not be stored.
+        const SENSITIVE_DATA = 0x80;
+        /// Just Latin characters should be entered.
+        const LATIN = 0x100;
+        /// The text input is multiline.
+        const MULTILINE = 0x200;
+    }
 }
 
 /// An opaque token used to activate the [`Window`].

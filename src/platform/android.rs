@@ -71,7 +71,7 @@
 //!    event loop (as shown above).
 
 use crate::event_loop::{ActiveEventLoop, EventLoop, EventLoopBuilder};
-use crate::window::{Window, WindowAttributes};
+use crate::window::{ImeHint, Window, WindowAttributes};
 
 use self::activity::{AndroidApp, ConfigurationRef, Rect};
 
@@ -117,6 +117,18 @@ pub trait WindowExtAndroid {
     fn content_rect(&self) -> Rect;
 
     fn config(&self) -> ConfigurationRef;
+
+    /// Describe the focused text field to the soft keyboard beyond its
+    /// [`ImePurpose`][crate::window::ImePurpose]: capitalization, corrections, whether the return
+    /// key types a line break...
+    fn set_ime_hint(&self, hint: ImeHint);
+
+    /// Same as [`set_ime_surrounding_text`].
+    fn set_ime_surrounding_text(&self, text: &str, cursor: usize, anchor: usize);
+
+    /// Show the soft keyboard again while the IME is allowed, e.g. when the user taps the focused
+    /// field after hiding the keyboard with the back button.
+    fn show_ime(&self);
 }
 
 impl WindowExtAndroid for Window {
@@ -126,6 +138,18 @@ impl WindowExtAndroid for Window {
 
     fn config(&self) -> ConfigurationRef {
         self.window.config()
+    }
+
+    fn set_ime_hint(&self, hint: ImeHint) {
+        self.window.set_ime_hint(hint)
+    }
+
+    fn set_ime_surrounding_text(&self, text: &str, cursor: usize, anchor: usize) {
+        self.window.set_ime_surrounding_text(text, cursor, anchor)
+    }
+
+    fn show_ime(&self) {
+        self.window.show_ime()
     }
 }
 

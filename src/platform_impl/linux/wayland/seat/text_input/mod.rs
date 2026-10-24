@@ -167,6 +167,14 @@ impl ZwpTextInputV3Ext for ZwpTextInputV3 {
             ImePurpose::Normal => (ContentHint::None, ContentPurpose::Normal),
             ImePurpose::Password => (ContentHint::SensitiveData, ContentPurpose::Password),
             ImePurpose::Terminal => (ContentHint::None, ContentPurpose::Terminal),
+            ImePurpose::Number => (ContentHint::None, ContentPurpose::Number),
+            ImePurpose::Phone => (ContentHint::None, ContentPurpose::Phone),
+            ImePurpose::Url => (ContentHint::None, ContentPurpose::Url),
+            ImePurpose::Email => (ContentHint::None, ContentPurpose::Email),
+            ImePurpose::Pin => (ContentHint::SensitiveData, ContentPurpose::Pin),
+            ImePurpose::Date => (ContentHint::None, ContentPurpose::Date),
+            ImePurpose::Time => (ContentHint::None, ContentPurpose::Time),
+            ImePurpose::DateTime => (ContentHint::None, ContentPurpose::Datetime),
         };
         self.set_content_type(hint, purpose);
     }
