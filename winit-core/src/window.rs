@@ -1360,7 +1360,7 @@ pub trait Window: Any + Send + Sync + fmt::Debug {
     ///
     /// ## Platform-specific
     ///
-    /// - **iOS / Android / Web / Windows / X11 / macOS / Orbital:** Unsupported.
+    /// - **iOS / Web / Windows / X11 / macOS / Orbital:** Unsupported.
     #[deprecated = "use Window::request_ime_update instead"]
     fn set_ime_purpose(&self, purpose: ImePurpose) {
         if self.ime_capabilities().map(|caps| caps.hint_and_purpose()).unwrap_or(false) {
@@ -1815,7 +1815,7 @@ pub enum WindowLevel {
 ///
 /// ## Platform-specific
 ///
-/// - **iOS / Android / Web / Windows / X11 / macOS / Orbital:** Unsupported.
+/// - **iOS / Web / Windows / X11 / macOS / Orbital:** Unsupported.
 #[non_exhaustive]
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -1858,7 +1858,7 @@ bitflags! {
     ///
     /// ## Platform-specific
     ///
-    /// - **iOS / Android / Web / Windows / X11 / macOS / Orbital:** Unsupported.
+    /// - **iOS / Web / Windows / X11 / macOS / Orbital:** Unsupported.
     #[non_exhaustive]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

@@ -44,3 +44,4 @@ changelog entry.
 
 - On Android, report soft keyboard input from `GameActivity` as `WindowEvent::Ime` events, with
   the composing text as `Ime::Preedit`, and load `ImeSurroundingText` into the keyboard.
+- On Android, configure the soft keyboard from `ImeHint` and `ImePurpose`.

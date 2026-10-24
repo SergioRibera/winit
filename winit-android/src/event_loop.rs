@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use android_activity::input::{
-    InputEvent, KeyAction, Keycode, MotionAction, TextInputState, TextSpan,
+    ImeOptions, InputEvent, InputType, InputTypeClass, KeyAction, Keycode, MotionAction,
+    TextInputAction, TextInputState, TextSpan,
 };
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
@@ -27,7 +28,7 @@ use winit_core::event_loop::{
 };
 use winit_core::monitor::{Fullscreen, MonitorHandle as CoreMonitorHandle};
 use winit_core::window::{
-    self, CursorGrabMode, ImeCapabilities, ImePurpose, ImeRequest, ImeRequestError,
+    self, CursorGrabMode, ImeCapabilities, ImeHint, ImePurpose, ImeRequest, ImeRequestError,
     ImeSurroundingText, ResizeDirection, Theme, Window as CoreWindow, WindowAttributes,
     WindowButtons, WindowId, WindowLevel,
 };
@@ -837,6 +838,8 @@ pub struct Window {
     app: AndroidApp,
     ime_capabilities: Mutex<Option<ImeCapabilities>>,
     ime: Arc<Mutex<ImeState>>,
+    /// The hint and purpose the keyboard was last configured for.
+    ime_hint_and_purpose: Mutex<Option<(ImeHint, ImePurpose)>>,
     redraw_requester: RedrawRequester,
 }
 
@@ -857,8 +860,24 @@ impl Window {
             app: el.app.clone(),
             ime_capabilities: Default::default(),
             ime: el.ime.clone(),
+            ime_hint_and_purpose: Default::default(),
             redraw_requester: el.redraw_requester.clone(),
         })
+    }
+
+    /// Configure the keyboard for the kind of text being entered.
+    ///
+    /// Like loading text, this restarts the input connection, so it is skipped when nothing
+    /// changed.
+    fn set_ime_hint_and_purpose(&self, hint: ImeHint, purpose: ImePurpose) {
+        let mut current = self.ime_hint_and_purpose.lock().unwrap();
+        if *current == Some((hint, purpose)) {
+            return;
+        }
+        *current = Some((hint, purpose));
+
+        let (input_type, action, options) = editor_info(hint, purpose);
+        self.app.set_ime_editor_info(input_type, action, options);
     }
 
     pub(crate) fn config(&self) -> ConfigurationRef {
@@ -1060,6 +1079,12 @@ impl CoreWindow for Window {
 
                 // The keyboard buffer is emptied on disable, so without surrounding text there is
                 // nothing to load and the keyboard starts from an empty field.
+                let (hint, purpose) = data
+                    .hint_and_purpose
+                    .filter(|_| capabilities.hint_and_purpose())
+                    .unwrap_or((ImeHint::NONE, ImePurpose::Normal));
+                self.set_ime_hint_and_purpose(hint, purpose);
+
                 let mut ime = self.ime.lock().unwrap();
                 ime.enable();
                 let surrounding =
@@ -1072,6 +1097,11 @@ impl CoreWindow for Window {
                 let Some(capabilities) = *current_caps else {
                     return Err(ImeRequestError::NotEnabled);
                 };
+                if let Some((hint, purpose)) =
+                    data.hint_and_purpose.filter(|_| capabilities.hint_and_purpose())
+                {
+                    self.set_ime_hint_and_purpose(hint, purpose);
+                }
                 if let Some(surrounding) =
                     data.surrounding_text.as_ref().filter(|_| capabilities.surrounding_text())
                 {
@@ -1098,8 +1128,6 @@ impl CoreWindow for Window {
     fn ime_capabilities(&self) -> Option<ImeCapabilities> {
         *self.ime_capabilities.lock().unwrap()
     }
-
-    fn set_ime_purpose(&self, _purpose: ImePurpose) {}
 
     fn focus_window(&self) {}
 
@@ -1169,4 +1197,74 @@ fn screen_size(app: &AndroidApp) -> PhysicalSize<u32> {
 
 fn scale_factor(app: &AndroidApp) -> f64 {
     app.config().density().map(|dpi| dpi as f64 / 160.0).unwrap_or(1.0)
+}
+
+/// The `EditorInfo` describing a text field with `hint` and `purpose` to the keyboard.
+fn editor_info(hint: ImeHint, purpose: ImePurpose) -> (InputType, TextInputAction, ImeOptions) {
+    let mut input_type = match purpose {
+        ImePurpose::Password => {
+            InputType::TYPE_CLASS_TEXT | InputType::TYPE_TEXT_VARIATION_PASSWORD
+        },
+        ImePurpose::Number => {
+            InputType::TYPE_CLASS_NUMBER
+                | InputType::TYPE_NUMBER_FLAG_DECIMAL
+                | InputType::TYPE_NUMBER_FLAG_SIGNED
+        },
+        ImePurpose::Pin => InputType::TYPE_CLASS_NUMBER | InputType::TYPE_NUMBER_VARIATION_PASSWORD,
+        ImePurpose::Phone => InputType::TYPE_CLASS_PHONE,
+        ImePurpose::Url => InputType::TYPE_CLASS_TEXT | InputType::TYPE_TEXT_VARIATION_URI,
+        ImePurpose::Email => {
+            InputType::TYPE_CLASS_TEXT | InputType::TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+        },
+        ImePurpose::Date => {
+            InputType::TYPE_CLASS_DATETIME | InputType::TYPE_DATETIME_VARIATION_DATE
+        },
+        ImePurpose::Time => {
+            InputType::TYPE_CLASS_DATETIME | InputType::TYPE_DATETIME_VARIATION_TIME
+        },
+        ImePurpose::DateTime => InputType::TYPE_CLASS_DATETIME,
+        // Terminals do their own completion, and corrections would rewrite commands.
+        ImePurpose::Terminal => {
+            InputType::TYPE_CLASS_TEXT | InputType::TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        },
+        _ => InputType::TYPE_CLASS_TEXT,
+    };
+    // Extracted text mode would show the `GameTextInput` buffer in a full screen editor, but that
+    // buffer only holds the surrounding text the application provided, if any.
+    let mut options = ImeOptions::IME_FLAG_NO_FULLSCREEN;
+    let mut action = TextInputAction::Unspecified;
+
+    if input_type.class() == InputTypeClass::Text {
+        if hint.contains(ImeHint::SPELLCHECK) {
+            input_type |= InputType::TYPE_TEXT_FLAG_AUTO_CORRECT;
+        }
+        if hint.contains(ImeHint::UPPERCASE) {
+            input_type |= InputType::TYPE_TEXT_FLAG_CAP_CHARACTERS;
+        } else if hint.contains(ImeHint::TITLECASE) {
+            input_type |= InputType::TYPE_TEXT_FLAG_CAP_WORDS;
+        } else if hint.contains(ImeHint::AUTO_CAPITALIZATION) {
+            input_type |= InputType::TYPE_TEXT_FLAG_CAP_SENTENCES;
+        }
+        if hint.contains(ImeHint::HIDDEN_TEXT) && purpose != ImePurpose::Password {
+            input_type.remove(InputType::TYPE_MASK_VARIATION);
+            input_type |= InputType::TYPE_TEXT_VARIATION_PASSWORD;
+        }
+        if hint.contains(ImeHint::MULTILINE) {
+            // The return key types a line break instead of performing an action.
+            input_type |= InputType::TYPE_TEXT_FLAG_MULTI_LINE;
+            options |= ImeOptions::IME_FLAG_NO_ENTER_ACTION;
+            action = TextInputAction::None;
+        }
+    }
+    if hint.contains(ImeHint::SENSITIVE_DATA) {
+        if input_type.class() == InputTypeClass::Text {
+            input_type |= InputType::TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+        }
+        options |= ImeOptions::IME_FLAG_NO_PERSONALIZED_LEARNING;
+    }
+    if hint.contains(ImeHint::LATIN) {
+        options |= ImeOptions::IME_FLAG_FORCE_ASCII;
+    }
+
+    (input_type, action, options)
 }
